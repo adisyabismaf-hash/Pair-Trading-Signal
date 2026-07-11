@@ -1,0 +1,62 @@
+name: Agent Signal (24/7)
+
+# Satu workflow, banyak jadwal — tugas ditentukan dari cron yang memicu.
+# WIB = UTC+7. Menit di-offset dari scanner pair trading (*/15) biar tidak rebutan runner.
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"   # fast: harga+wallet+derivatif+realtime (tiap 20 mnt)
+    - cron: "17 1,5,9,13,17,21 * * *"  # slow: TVL+fees (tiap 4 jam)
+    - cron: "40 23 * * *"       # daily-ingest: stablecoin+F&G (06:40 WIB)
+    - cron: "0 0 * * *"         # outlook 07:00 WIB
+    - cron: "0 10 * * *"        # digest 17:00 WIB
+    - cron: "30 1 * * 0"        # weekly review Minggu 08:30 WIB
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Tugas (fast|slow|daily-ingest|outlook|digest|weekly|all-ingest)"
+        default: "fast"
+
+concurrency:
+  group: agent-signal
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pilih tugas dari cron pemicu
+        id: pick
+        run: |
+          case "${{ github.event.schedule }}" in
+            "7,27,47 * * * *")             echo "task=fast" >> "$GITHUB_OUTPUT" ;;
+            "17 1,5,9,13,17,21 * * *")     echo "task=slow" >> "$GITHUB_OUTPUT" ;;
+            "40 23 * * *")                 echo "task=daily-ingest" >> "$GITHUB_OUTPUT" ;;
+            "0 0 * * *")                   echo "task=outlook" >> "$GITHUB_OUTPUT" ;;
+            "0 10 * * *")                  echo "task=digest" >> "$GITHUB_OUTPUT" ;;
+            "30 1 * * 0")                  echo "task=weekly" >> "$GITHUB_OUTPUT" ;;
+            *)                             echo "task=${{ inputs.task || 'fast' }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Jalankan Agent Signal — ${{ steps.pick.outputs.task }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DERIVATIVES_PROVIDER: extended
+          EXTENDED_BASE_URL: https://api.starknet.extended.exchange
+          TZ: Asia/Jakarta
+        run: python agent_runner.py ${{ steps.pick.outputs.task }}

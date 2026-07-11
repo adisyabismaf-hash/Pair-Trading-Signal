@@ -1,0 +1,33 @@
+# =====================================================================
+# watchlist.yaml — v1 TEMPLATE (isi sesuai fokusmu, jangan lebih dari batas)
+# Aturan: kualitas > kuantitas. Kuota CoinGecko 10.000 call/bulan.
+# =====================================================================
+
+assets:                      # maks 30 — coingecko_id WAJIB persis (cek /coins/list)
+  - {symbol: BTC,  coingecko_id: bitcoin,  tier: core}
+  - {symbol: ETH,  coingecko_id: ethereum, tier: core}
+  - {symbol: HYPE, coingecko_id: hyperliquid, tier: satellite}
+  - {symbol: SOL,  coingecko_id: solana, tier: satellite}
+  - {symbol: XRP,  coingecko_id: ripple, tier: satellite}
+  - {symbol: LIT,  coingecko_id: lighter, tier: satellite}
+  - {symbol: AAVE,  coingecko_id: aave, tier: satellite}
+
+protocols:                   # maks 20 — slug WAJIB persis dari defillama.com/protocol/{slug}
+  - {name: Hyperliquid, llama_slug: hyperliquid, track: [tvl, fees, dex volume, perps volume]}
+  - {name: Lighter, llama_slug: lighter, track: [tvl, fees, dex volume, perps volume]}
+  - {name: Aave, llama_slug: AAVE, track: [tvl, fees, dex volume, perps volume]}
+
+wallets:                     # maks 20 — WAJIB berlabel; tanpa label = tidak dipantau
+  # - {label: Treasury-ProtokolX, address: "0x____", chain: ethereum,
+  #    category: treasury, threshold_usd_override: null}
+  # category: treasury | whale | deployer | smart_money
+
+exchange_labels:             # untuk membedakan "ke exchange" vs "antar wallet sendiri"
+  source: "Etherscan public name tags"
+  # - {label: Binance-Deposit-1, address: "0x____"}
+
+# Catatan pengisian:
+# 1. Verifikasi setiap coingecko_id & llama_slug via 1 API call sebelum masuk produksi
+#    (typo slug = data kosong diam-diam, bukan error).
+# 2. Wallet whale: mulai dari riset Dune/Arkham publik, bukan tebakan.
+# 3. Review daftar ini bulanan — watchlist basi = sinyal basi.

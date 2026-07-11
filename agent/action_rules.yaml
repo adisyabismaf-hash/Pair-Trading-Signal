@@ -1,0 +1,141 @@
+# =====================================================================
+# action_rules.yaml — v1.0 (7 Juli 2026)
+# Sumber kebenaran untuk Signal Engine. LLM TIDAK boleh mengubah nilai di sini.
+# STATUS KALIBRASI: BELUM TERKALIBRASI — semua threshold adalah titik awal.
+# Review wajib: setiap Minggu bersamaan Weekly Review, minimal 4 minggu pertama.
+# =====================================================================
+
+meta:
+  version: "1.0"
+  created: "2026-07-07"
+  next_calibration_review: "2026-08-04"
+  false_positive_target_pct: 25   # jika FP 4-mingguan > ini -> threshold modul terkait dinaikkan
+
+# ---------------------------------------------------------------------
+# 1. ACTION BIAS — matriks eskalasi (deterministik, bukan opini LLM)
+# ---------------------------------------------------------------------
+action_bias:
+  levels: [INFO, MONITOR, REVIEW, RISK_OFF, OPPORTUNITY]
+  escalation_rules:
+    - id: E1
+      rule: "1 modul trigger tunggal"
+      max_level: MONITOR
+    - id: E2
+      rule: "2 modul independen trigger pada entitas sama dalam 24 jam"
+      min_level: REVIEW
+    - id: E3
+      rule: ">=2 modul searah + konfirmasi derivatif (M6) searah"
+      allow_level: [RISK_OFF, OPPORTUNITY]
+    - id: E4
+      rule: "entitas sinyal ada di positions.yaml"
+      effect: "naikkan 1 tingkat (maks RISK_OFF/OPPORTUNITY)"
+    - id: E5
+      rule: "sinyal tanpa field invalidation terisi"
+      effect: "DROP — tidak boleh dikirim"
+
+# ---------------------------------------------------------------------
+# 2. THRESHOLD PER MODUL (M1–M7)
+# ---------------------------------------------------------------------
+modules:
+  M1_tvl_monitor:
+    source: "DefiLlama /protocol/{slug}, /v2/chains"
+    interval_minutes: 240
+    triggers:
+      delta_24h_pct: 8       # |ΔTVL 24j| >= 8%
+      delta_7d_pct: 15       # |ΔTVL 7h| >= 15%
+    severity_map:
+      "8-15": MONITOR
+      ">15":  REVIEW_CANDIDATE   # butuh E2/E3 untuk naik level
+    invalidation_default: "TVL pulih >50% dari penurunan dalam 48 jam"
+
+  M2_revenue_fees:
+    source: "DefiLlama /overview/fees, /summary/fees/{slug}"
+    interval_minutes: 240
+    triggers:
+      daily_vs_7d_avg_pct: 20   # |fees harian vs rata2 7h| >= 20%
+    note: "gunakan median 7h jika ada outlier event (airdrop/points)"
+
+  M3_wallet_tracker:
+    source: "Etherscan V2 txlist/tokentx"
+    interval_minutes: 20
+    triggers:
+      transfer_usd_min: 500000        # transfer tunggal >= $500k
+      dormant_days_reactivated: 90    # wallet diam >=90 hari lalu aktif
+      to_exchange_multiplier: 0.5     # ke alamat CEX berlabel: threshold turun 50% (=$250k)
+    severity_map:
+      to_unknown_address: MONITOR
+      to_exchange: REVIEW_CANDIDATE
+      treasury_outflow: REVIEW_CANDIDATE
+    invalidation_default: "alamat tujuan teridentifikasi CEX/custody resmi dalam 12 jam"
+
+  M4_price_volume_anomaly:
+    source: "CoinGecko /coins/markets"
+    interval_minutes: 15
+    triggers:
+      volume_zscore_30d: 2.5    # kandidat kalibrasi pertama jika FP tinggi
+      price_move_4h_pct: 7
+    max_level: MONITOR          # modul paling berisik — tidak pernah eskalasi sendiri
+
+  M5_stablecoin_flow:
+    source: "DefiLlama /stablecoins"
+    interval_minutes: 1440
+    triggers:
+      total_supply_delta_7d_pct: 0.5
+    max_level: INFO             # masuk regime score, bukan alert
+
+  M6_derivatives:
+    source: "Binance funding, open interest"
+    interval_minutes: 60
+    triggers:
+      funding_8h_hot: 0.05      # > +0.05% = long crowded
+      funding_8h_extreme: 0.08  # trigger REVIEW
+      funding_8h_negative: -0.03
+      oi_delta_24h_pct: 10
+    invalidation_default: "funding kembali <0.03% selama 2 periode berturut-turut"
+
+  M7_sentiment:
+    source: "Alternative.me F&G"
+    interval_minutes: 1440
+    triggers:
+      extreme_fear_below: 25
+      extreme_greed_above: 75
+    max_level: INFO
+
+# ---------------------------------------------------------------------
+# 3. REGIME SCORE (Blok A daily outlook) — bobot total 100
+# ---------------------------------------------------------------------
+regime_score:
+  weights:
+    fear_greed: 15
+    stablecoin_supply_delta_7d: 20
+    watchlist_breadth_7d: 25     # % aset watchlist hijau 7 hari
+    funding_aggregate: 20
+    tvl_aggregate_delta: 20
+  labels:
+    RISK_OFF:       {max: 34}
+    NETRAL:         {min: 35, max: 55}
+    NETRAL_BULLISH: {min: 56, max: 70}
+    RISK_ON:        {min: 71}
+
+# ---------------------------------------------------------------------
+# 4. NOTIFIKASI & ANTI-SPAM
+# ---------------------------------------------------------------------
+notifications:
+  daily_outlook_time: "07:00"        # WIB (Asia/Jakarta)
+  evening_digest_time: "17:00"
+  weekly_review: "SUN 08:00"
+  realtime_min_level: REVIEW         # hanya REVIEW/RISK_OFF/OPPORTUNITY real-time
+  max_realtime_alerts_per_day: 5     # lebih dari ini -> bundel jadi 1 digest darurat
+  followup_check_hours: 24           # cek status invalidation H+1 untuk RISK_OFF/OPPORTUNITY
+  channel_primary: telegram
+  channel_secondary: null            # instagram_graph_api (fase 5, opsional)
+
+# ---------------------------------------------------------------------
+# 5. GUARDRAIL LLM
+# ---------------------------------------------------------------------
+llm_guardrails:
+  can_modify_action_bias: false
+  numbers_must_exist_in_payload: true
+  invalidation_must_be_machine_verifiable: true
+  forbidden_words: ["pasti", "dijamin", "guaranteed", "beli sekarang", "jual sekarang"]
+  required_footer: "Bukan nasihat keuangan."

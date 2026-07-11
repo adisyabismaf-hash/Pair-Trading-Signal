@@ -1,0 +1,16 @@
+# =====================================================================
+# positions.yaml — posisi/holding AKTIF user (privat, lokal saja)
+# Dipakai aturan E4: sinyal yang menyentuh entitas di sini naik 1 tingkat.
+# JANGAN tulis nominal absolut — cukup entity + catatan (privasi;
+# hanya "punya/tidak" yang dikirim ke LLM prompt).
+# =====================================================================
+# Skema per item:
+#   entity: BTC                    # symbol aset ATAU llama_slug protokol
+#   kind: asset                    # asset | protocol
+#   note: "core hold"              # opsional
+#   invalidation_personal: "close di bawah $X weekly"   # opsional
+
+positions: []
+# positions:
+#   - {entity: BTC, kind: asset, note: "core", invalidation_personal: ""}
+#   - {entity: hyperliquid, kind: protocol, note: "", invalidation_personal: ""}

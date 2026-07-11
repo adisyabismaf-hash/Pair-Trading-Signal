@@ -5,3 +5,7 @@ __pycache__/
 venv/
 .env
 *.log
+*.db
+.pytest_cache/
+agent/outbox/
+agent/.env
