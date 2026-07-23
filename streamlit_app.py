@@ -26,6 +26,10 @@ for _key in ("DATABASE_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "EXTENDED
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "agent"))
 
+# Pair Trading Tools v2 (multi-venue correlation screening) lives in ./pair-trading-v2.
+# Override location with the V2_DIR env var if deployed elsewhere.
+V2_DIR = os.path.abspath(os.environ.get("V2_DIR", str(ROOT / "pair-trading-v2")))
+
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 import pandas as pd  # noqa: E402
@@ -380,8 +384,9 @@ def _agent_notifier():
 st.sidebar.markdown("## 🧭 Trading<span style='color:#34d399'>Command</span>Center",
                     unsafe_allow_html=True)
 st.sidebar.caption("Pair Trading · MA50 · Agent Signal On-Chain")
-page = st.sidebar.radio("Menu", ["🏠 Ringkasan", "🔁 Pair Trading", "🤖 Agent Signal",
-                                 "📈 Performa", "⚙️ Pengaturan"], label_visibility="collapsed")
+page = st.sidebar.radio("Menu", ["🏠 Ringkasan", "🔁 Pair Trading", "⭐ Recommended",
+                                 "🤖 Agent Signal", "📈 Performa", "⚙️ Pengaturan"],
+                        label_visibility="collapsed")
 
 st.sidebar.divider()
 st.sidebar.markdown("<div class='svc-line'><span>Database (Neon)</span>"
@@ -862,12 +867,185 @@ def page_settings():
                    "sengaja tidak diedit dari UI supaya terversi di Git).")
 
 
+# ============================================================ PAGE: recommended
+
+def _load_v2():
+    """Import the v2 scan pipeline from ./pair-trading-v2. Returns (pipeline, universe)
+    or None if the folder is missing."""
+    if not os.path.isdir(V2_DIR):
+        return None
+    if V2_DIR not in sys.path:
+        sys.path.insert(0, V2_DIR)
+    import pipeline as v2_pipeline
+    import universe as v2_universe
+    return v2_pipeline, v2_universe
+
+
+def _build_recommendations(res, v2_universe, watched_pairs) -> list[dict]:
+    table = v2_universe.build_symbol_table()
+    watched = set()
+    for p in watched_pairs:
+        watched.add((p.base_market, p.quote_market))
+        watched.add((p.quote_market, p.base_market))
+    items = []
+    for row in res.qualified.itertuples():
+        src_a, tick_a = table.get(row.symbol_a, (None, None))
+        src_b, tick_b = table.get(row.symbol_b, (None, None))
+        addable = src_a == "extended" and src_b == "extended"
+        items.append({
+            "symbol_a": row.symbol_a, "symbol_b": row.symbol_b,
+            "corr_level": float(row.corr_level), "corr_returns": float(row.corr_returns),
+            "base_market": tick_a if addable else None,
+            "quote_market": tick_b if addable else None,
+            "addable": addable, "source_a": src_a, "source_b": src_b,
+            "in_watchlist": addable and (tick_a, tick_b) in watched,
+        })
+    return items
+
+
+def _format_reco_telegram(items: list[dict], threshold: float) -> str:
+    lines = ["⭐ <b>REKOMENDASI PAIR TRADING</b>",
+             f"Pair dengan |korelasi| ≥ {threshold:.2f} (scan multi-venue):", ""]
+    for it in items[:15]:
+        wl = " 👁️" if it.get("in_watchlist") else ""
+        ext = "" if it["addable"] else " (di luar Extended)"
+        lines.append(f"• <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
+                     f"level {it['corr_level']:+.3f}, returns {it['corr_returns']:+.3f}{ext}{wl}")
+    if len(items) > 15:
+        lines.append(f"… dan {len(items) - 15} pair lainnya")
+    lines += ["", "Tambahkan ke watchlist lewat halaman ⭐ Recommended untuk mulai "
+              "memantau sinyal z-score-nya."]
+    return "\n".join(lines)
+
+
+def page_recommended():
+    st.markdown("# ⭐ Recommended <span class='pill on'>KORELASI ≥ 0.90</span>",
+                unsafe_allow_html=True)
+    st.caption("Pair dengan korelasi tinggi hasil screening multi-venue (Extended · Yahoo · "
+               "Binance) — pilih untuk masuk watchlist, atau kirim daftarnya ke Telegram.")
+
+    try:
+        loaded = _load_v2()
+    except Exception as exc:
+        st.error(f"❌ Gagal memuat modul v2 dari `{V2_DIR}`:\n\n{exc}")
+        return
+    if loaded is None:
+        st.warning(f"Folder `pair-trading-v2` tidak ditemukan di `{V2_DIR}`. "
+                   "Pastikan foldernya ikut ter-deploy, atau set env var `V2_DIR`.")
+        return
+    v2_pipeline, v2_universe = loaded
+
+    c1, c2 = st.columns([1, 3])
+    threshold = c1.number_input("Threshold |korelasi|", 0.50, 1.00, 0.90, 0.01)
+    rescan = c2.button("🔄 Scan Ulang", type="primary")
+
+    cache = st.session_state.get("reco_cache")
+    if rescan or cache is None or cache["threshold"] != float(threshold):
+        with st.spinner("Memindai korelasi di 3 venue… (±20 detik)"):
+            try:
+                res = v2_pipeline.scan_pipeline(
+                    ["crypto", "tradfi", "external", "spread"],
+                    corr_threshold=float(threshold), corr_method="level",
+                    run_backtest=False)
+            except Exception as exc:
+                st.error(f"❌ Scan gagal: {exc}")
+                return
+        if not res.ok:
+            st.error(f"❌ Scan gagal: {res.reason}")
+            return
+        cache = {"result": res, "threshold": float(threshold),
+                 "at": pd.Timestamp.now(tz=WIB).strftime("%d %b %H:%M WIB")}
+        st.session_state["reco_cache"] = cache
+    res = cache["result"]
+
+    db = SessionLocal()
+    try:
+        watched_pairs = db.execute(select(WatchedPair)).scalars().all()
+    finally:
+        db.close()
+    items = _build_recommendations(res, v2_universe, watched_pairs)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Pair Lolos", len(items))
+    m2.metric("Bisa Dipantau", sum(i["addable"] for i in items), "kedua kaki di Extended")
+    m3.metric("Sudah di Watchlist", sum(i["in_watchlist"] for i in items))
+    m4.metric("Scan Terakhir", cache["at"])
+
+    if not items:
+        st.info("Tidak ada pair yang lolos threshold ini.")
+        return
+
+    def status_of(i):
+        if i["in_watchlist"]:
+            return "👁️ Dipantau"
+        return "🟦 Kandidat" if i["addable"] else "⬜ Di luar Extended"
+
+    st.dataframe(pd.DataFrame([{
+        "Pair": f"{i['symbol_a']} vs {i['symbol_b']}",
+        "Korelasi Level": round(i["corr_level"], 3),
+        "Korelasi Returns": round(i["corr_returns"], 3),
+        "Sumber": f"{i['source_a']} / {i['source_b']}",
+        "Status": status_of(i),
+    } for i in items]), width="stretch", hide_index=True)
+    st.caption("💡 Korelasi **level** tinggi tapi **returns** rendah = dua aset kebetulan "
+               "sama-sama naik, bukan edge trading. Pair di luar Extended (Brent, PAXG, XAUT) "
+               "tidak bisa dipantau live oleh engine ini.")
+
+    st.divider()
+    col_add, col_tg = st.columns(2)
+
+    with col_add:
+        st.subheader("➕ Tambah ke Watchlist")
+        candidates = [i for i in items if i["addable"] and not i["in_watchlist"]]
+        if not candidates:
+            st.caption("Semua kandidat Extended sudah ada di watchlist.")
+        else:
+            labels = [f"{i['symbol_a']}/{i['symbol_b']}" for i in candidates]
+            chosen = st.multiselect("Pilih pair", labels, key="reco_pick")
+            if st.button("➕ Tambahkan", disabled=not chosen, key="reco_add"):
+                db = SessionLocal()
+                added = 0
+                try:
+                    for i in candidates:
+                        if f"{i['symbol_a']}/{i['symbol_b']}" not in chosen:
+                            continue
+                        dupe = db.execute(select(WatchedPair).where(
+                            WatchedPair.base_market == i["base_market"],
+                            WatchedPair.quote_market == i["quote_market"])).scalar_one_or_none()
+                        if not dupe:
+                            db.add(WatchedPair(base_market=i["base_market"],
+                                               quote_market=i["quote_market"]))
+                            added += 1
+                    db.commit()
+                finally:
+                    db.close()
+                st.session_state["notice"] = f"✅ {added} pair masuk watchlist."
+                st.cache_data.clear()
+                st.rerun()
+
+    with col_tg:
+        st.subheader("📨 Kirim ke Telegram")
+        st.caption("Kirim daftar rekomendasi ini ke Telegram sebagai sinyal pair apa "
+                   "saja yang bisa masuk watchlist.")
+        if st.button("📨 Kirim Sekarang", key="reco_tg"):
+            ok = telegram_notifier.send_message(
+                _format_reco_telegram(items, cache["threshold"]))
+            st.session_state["notice"] = (
+                f"📨 Rekomendasi {len(items)} pair terkirim ke Telegram." if ok
+                else "")
+            if not ok:
+                st.session_state["notice_err"] = "❌ Telegram gagal — cek token/chat ID."
+            st.rerun()
+
+
 # ============================================================ router
 
 if page.startswith("🏠"):
     page_overview()
 elif page.startswith("🔁"):
     page_pair()
+elif page.startswith("⭐"):
+    page_recommended()
 elif page.startswith("🤖"):
     page_agent()
 elif page.startswith("📈"):

@@ -1,0 +1,226 @@
+"""Scan pipeline for Pair Trading Tools v2, decoupled from the CLI.
+
+`scan_pipeline()` runs fetch -> align -> correlation screening -> backtest and returns
+plain dataframes/lists, so it can be driven by scanner.py (CLI, prints + writes reports)
+or by the v1 Streamlit dashboard (cloud/streamlit_app.py) without shelling out.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from config import settings
+from data_sources import SOURCES, DataSourceError
+from universe import DEFAULT_UNIVERSE, SPREAD_PAIRS
+from analytics import correlation_report, qualifying_pairs, backtest_pair
+from analytics.backtest import summarize_trades
+
+logger = logging.getLogger("pipeline")
+
+
+@dataclass
+class ScanResult:
+    ok: bool
+    reason: str = ""
+    aligned: pd.DataFrame = field(default_factory=pd.DataFrame)
+    corr_level: pd.DataFrame = field(default_factory=pd.DataFrame)
+    corr_returns: pd.DataFrame = field(default_factory=pd.DataFrame)
+    qualified: pd.DataFrame = field(default_factory=pd.DataFrame)
+    trade_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    trades: list = field(default_factory=list)
+    symbols_fetched: list = field(default_factory=list)
+    symbols_failed: list = field(default_factory=list)
+    shortened_windows: list = field(default_factory=list)
+    skipped_short_history: list = field(default_factory=list)
+    spread_pair_labels: dict = field(default_factory=dict)  # "A/B" -> spread label
+
+
+def fetch_universe(symbol_specs: list[tuple[str, str, str]], limit: int) -> dict[str, pd.Series]:
+    """symbol_specs: list of (symbol, source_name, source_ticker). Returns symbol -> close series
+    (indexed by ms-epoch timestamp), skipping any symbol whose fetch fails."""
+    out = {}
+    for symbol, source_name, ticker in symbol_specs:
+        source = SOURCES.get(source_name)
+        if source is None:
+            logger.warning("Skipping %s: unknown source %r", symbol, source_name)
+            continue
+        try:
+            candles = source.fetch_daily_closes(ticker, limit)
+            s = pd.Series({c.t_ms: c.close for c in candles}).sort_index()
+            s = s[~s.index.duplicated(keep="last")]
+            out[symbol] = s
+            logger.info("Fetched %s (%s/%s): %d candles, %s -> %s", symbol, source_name, ticker,
+                       len(s), pd.to_datetime(s.index.min(), unit="ms").date(),
+                       pd.to_datetime(s.index.max(), unit="ms").date())
+        except DataSourceError as exc:
+            logger.warning("Skipping %s (%s/%s): %s", symbol, source_name, ticker, exc)
+    return out
+
+
+def align_closes(series_by_symbol: dict[str, pd.Series]) -> pd.DataFrame:
+    """Outer-join all series onto a shared daily grid. Gaps inside a symbol's history
+    (weekends/holidays for tradfi) are forward-filled; days before a symbol listed stay
+    NaN, so a short-history symbol (e.g. XAUT, listed 2026-03) no longer truncates the
+    whole universe — each pair is later evaluated on its own overlap."""
+    if not series_by_symbol:
+        return pd.DataFrame()
+    day_ms = 86_400_000
+    # Venues stamp their daily candle at different times within the day (Extended 00:00
+    # UTC, Binance close-time 23:59:59.999, Yahoo the exchange's open) — floor every
+    # timestamp to its UTC day so all sources land on one shared grid.
+    normalized = {}
+    for symbol, s in series_by_symbol.items():
+        ns = pd.Series(s.values, index=(s.index // day_ms) * day_ms)
+        normalized[symbol] = ns[~ns.index.duplicated(keep="last")]
+    start = min(s.index.min() for s in normalized.values())
+    end = min(s.index.max() for s in normalized.values())  # don't ffill past a stale source's last candle
+    if start >= end:
+        return pd.DataFrame()
+    idx = list(range(start, end + 1, day_ms))
+    df = pd.DataFrame(index=idx)
+    for symbol, s in normalized.items():
+        col = s.reindex(idx)
+        first_valid = col.first_valid_index()
+        if first_valid is not None:
+            col.loc[first_valid:] = col.loc[first_valid:].ffill()
+        df[symbol] = col
+    return df
+
+
+def resolve_symbol_specs(universe_names: list[str]) -> list[tuple[str, str, str]]:
+    specs = []
+    for name in universe_names:
+        if name == "spread":
+            continue  # spread pairs pull their symbols from whichever universes are selected
+        group = DEFAULT_UNIVERSE.get(name)
+        if group is None:
+            logger.warning("Unknown universe %r, skipping", name)
+            continue
+        specs.extend(group)
+    return specs
+
+
+def scan_pipeline(universe_names: list[str], *,
+                  corr_threshold: float = settings.corr_threshold,
+                  corr_method: str = settings.corr_method,
+                  lookback: int = settings.lookback_days,
+                  backtest_days: int = settings.backtest_days,
+                  min_backtest_days: int = settings.min_backtest_days,
+                  entry_zscore: float = settings.entry_zscore,
+                  exit_zscore: float = settings.exit_zscore,
+                  stop_zscore: float = settings.stop_zscore,
+                  max_holding_days: int = settings.max_holding_days,
+                  candle_limit: int = settings.candle_limit,
+                  run_backtest: bool = True) -> ScanResult:
+    include_spread = "spread" in universe_names
+    symbol_specs = resolve_symbol_specs(universe_names)
+
+    # Spread pairs may reference symbols outside the selected universes (e.g. BRENT/PAXG/
+    # XAUT even if you only asked for crypto,tradfi) -- pull those in too.
+    if include_spread:
+        wanted = {s for pair in SPREAD_PAIRS for s in (pair[1], pair[2])}
+        have = {s for s, _, _ in symbol_specs}
+        missing = wanted - have
+        if missing:
+            all_specs = {s: (src, tk) for group in DEFAULT_UNIVERSE.values() for s, src, tk in group}
+            for s in missing:
+                if s in all_specs:
+                    src, tk = all_specs[s]
+                    symbol_specs.append((s, src, tk))
+
+    logger.info("Universe: %d symbols requested", len(symbol_specs))
+    series_by_symbol = fetch_universe(symbol_specs, limit=candle_limit)
+    symbols_failed = sorted({s for s, _, _ in symbol_specs} - set(series_by_symbol.keys()))
+    if len(series_by_symbol) < 2:
+        return ScanResult(ok=False, reason="insufficient data",
+                          symbols_fetched=sorted(series_by_symbol), symbols_failed=symbols_failed)
+
+    aligned = align_closes(series_by_symbol)
+    if aligned.empty:
+        return ScanResult(ok=False, reason="no overlap",
+                          symbols_fetched=sorted(series_by_symbol), symbols_failed=symbols_failed)
+    logger.info("Aligned window: %s -> %s (%d days), symbols: %s",
+               pd.to_datetime(aligned.index.min(), unit="ms").date(),
+               pd.to_datetime(aligned.index.max(), unit="ms").date(),
+               len(aligned), list(aligned.columns))
+
+    logp = np.log(aligned)
+    corr = correlation_report(logp)
+    qualified = qualifying_pairs(logp, threshold=corr_threshold, method=corr_method)
+
+    needed_days = lookback + backtest_days
+    pairs_to_backtest = [(row.symbol_a, row.symbol_b, "correlation") for row in qualified.itertuples()]
+    spread_pair_labels = {}
+    if include_spread:
+        queued = {frozenset((a, b)) for a, b, _ in pairs_to_backtest}
+        for label, a, b, note in SPREAD_PAIRS:
+            if a in aligned.columns and b in aligned.columns:
+                spread_pair_labels[f"{a}/{b}"] = label
+            if frozenset((a, b)) in queued:
+                continue  # already qualified via correlation screening — don't backtest twice
+            if a in aligned.columns and b in aligned.columns:
+                pairs_to_backtest.append((a, b, f"spread:{label}"))
+            else:
+                logger.info("Spread pair %r skipped: %s or %s not in aligned data", label, a, b)
+
+    all_trades = []
+    skipped_short_history = []
+    shortened_windows = []
+    if not run_backtest:
+        # Correlation screening only (e.g. the "Recommended" pages) — much faster,
+        # skips the per-pair backtest entirely.
+        pairs_to_backtest = []
+    for a, b, tag in pairs_to_backtest:
+        # Each pair is backtested on its own overlapping history, so one late-listed
+        # symbol doesn't shrink the window for everyone else.
+        pair_df = aligned[[a, b]].dropna()
+        available = len(pair_df)
+        effective_backtest = backtest_days
+        if available < needed_days:
+            # Keep the lookback intact (it drives the hedge-ratio/z-score fit) and
+            # shorten the simulated period instead, down to a floor of min_backtest_days.
+            effective_backtest = available - lookback
+            if effective_backtest < min_backtest_days:
+                skipped_short_history.append(
+                    f"{a}/{b} ({tag}): {available} overlapping days < lookback "
+                    f"{lookback} + min backtest {min_backtest_days}")
+                continue
+            shortened_windows.append(f"{a}/{b} ({tag}): backtest window {effective_backtest}d "
+                                     f"instead of {backtest_days}d ({available} days overlap)")
+        try:
+            trades = backtest_pair(
+                pair_df, a, b,
+                lookback_days=lookback, backtest_days=effective_backtest,
+                entry_zscore=entry_zscore, exit_zscore=exit_zscore,
+                stop_zscore=stop_zscore, max_holding_days=max_holding_days,
+            )
+            all_trades.extend(trades)
+        except ValueError as exc:
+            skipped_short_history.append(f"{a}/{b} ({tag}): {exc}")
+
+    if shortened_windows:
+        logger.warning("Backtest window shortened for %d pair(s) with thin history:\n  %s",
+                       len(shortened_windows), "\n  ".join(shortened_windows))
+    if skipped_short_history:
+        logger.warning("Backtest skipped for %d pair(s) with insufficient history "
+                       "(need %d aligned days):\n  %s",
+                       len(skipped_short_history), needed_days,
+                       "\n  ".join(skipped_short_history))
+
+    return ScanResult(
+        ok=True,
+        aligned=aligned,
+        corr_level=corr["level"],
+        corr_returns=corr["returns"],
+        qualified=qualified,
+        trade_summary=summarize_trades(all_trades),
+        trades=all_trades,
+        symbols_fetched=sorted(series_by_symbol),
+        symbols_failed=symbols_failed,
+        shortened_windows=shortened_windows,
+        skipped_short_history=skipped_short_history,
+        spread_pair_labels=spread_pair_labels,
+    )

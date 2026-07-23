@@ -1,0 +1,38 @@
+name: Daily Pair Recommendations
+
+# Rekomendasi pair (korelasi >= 0.90) dikirim ke Telegram tiap hari 07:00 WIB (00:00 UTC).
+# Bisa juga dijalankan manual dari tab Actions.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: recommend
+  cancel-in-progress: false
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r pair-trading-v2/requirements.txt
+
+      - name: Run recommendation scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXTENDED_BASE_URL: https://api.starknet.extended.exchange
+          BINANCE_BASE_URL: https://data-api.binance.vision
+        run: python recommend.py
