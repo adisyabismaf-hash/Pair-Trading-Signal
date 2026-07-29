@@ -81,74 +81,82 @@ def _kartu_sinyal(idx: int, g: SignalGroup, arti: str) -> str:
             f"   Batal  : {g.invalidation}")
 
 
+_TREND_ARROW = {"UP": "▲", "DOWN": "▼", "SIDEWAYS": "→", "—": "—"}
+
+
+def _fng_emoji(v: int | None) -> str:
+    if v is None:
+        return "❔"
+    if v <= 24:
+        return "😱"
+    if v <= 44:
+        return "😟"
+    if v <= 55:
+        return "😐"
+    if v <= 74:
+        return "🙂"
+    return "🤑"
+
+
 def format_daily_outlook(now_wib: datetime, regime: tuple[int, str],
                          prev_score: int | None, snapshot: dict[str, Any],
-                         groups: list[SignalGroup], arti_map: dict[str, str],
-                         radar_lines: list[str]) -> str:
+                         market_rows: list[dict[str, Any]],
+                         fundamentals: list[dict[str, Any]]) -> str:
+    """Clean 7-point outlook: Fear & Greed, then per-asset price / OI / Stochastic /
+    multi-timeframe trend, then HYPE & LIT valuation. No signal cards (those go out as
+    separate real-time alerts)."""
     score, label = regime
-    # BLOK A — header + regime
+
+    # 1) Header + regime
     if prev_score is None:
         tren = ""
     else:
         arrow = "↑" if score > prev_score else ("↓" if score < prev_score else "→")
-        tren = f"  (kemarin: {prev_score}, {arrow})"
-    blok_a = (f"📊 OUTLOOK — {tanggal_id(now_wib)} · {now_wib:%H.%M} WIB\n"
-              f"Regime: ⚖️ {label.replace('_', '-')}  |  Skor: {score}/100{tren}")
+        tren = f"  (kemarin {prev_score} {arrow})"
+    blok_header = (f"📊 OUTLOOK — {tanggal_id(now_wib)} · {now_wib:%H.%M} WIB\n"
+                   f"Regime: ⚖️ {label.replace('_', '-')} · Skor {score}/100{tren}")
 
-    # BLOK B — snapshot angka murni, tanpa interpretasi
-    b_lines = []
-    pr = snapshot.get("prices", {})
-    if pr:
-        pairs = [f"{sym} {fmt_usd(v['price'])}  {fmt_pct(v['change_24h'])} 24j"
-                 for sym, v in list(pr.items())[:2]]
-        b_lines.append(" | ".join(pairs))
-    extra = []
-    if snapshot.get("fng") is not None:
-        extra.append(f"F&G: {snapshot['fng']} ({snapshot.get('fng_label', '')})")
-    if snapshot.get("stablecoin_delta_7d") is not None:
-        extra.append(f"Stablecoin 7h: {fmt_pct(snapshot['stablecoin_delta_7d'])}")
-    if snapshot.get("funding_btc") is not None:
-        extra.append(f"Funding BTC: {fmt_pct(snapshot['funding_btc'], 3)}/8j")
-    if extra:
-        b_lines.append(" · ".join(extra))
-    if snapshot.get("breadth_green") is not None:
-        b_lines.append(f"Watchlist: {snapshot['breadth_green']} hijau / "
-                       f"{snapshot['breadth_red']} merah (24j)")
-    blok_b = "\n".join(b_lines) or "Snapshot: data belum lengkap (cold start)"
+    # 2) Fear & Greed (global)
+    fng = snapshot.get("fng")
+    blok_fng = (f"{_fng_emoji(fng)} Fear & Greed: {fng} ({snapshot.get('fng_label', '')})"
+                if fng is not None else "❔ Fear & Greed: —")
 
-    # BLOK C — kartu sinyal, maks 5, urut severity
-    cards = [_kartu_sinyal(i + 1, g, arti_map.get(g.entity, ""))
-             for i, g in enumerate(groups[:5])]
-    blok_c = "\n\n".join(cards) if cards else "Tidak ada sinyal aktif."
+    # 3-5) Per-asset: harga · OI · Stochastic · trend 4H/1D/1W
+    m_lines = ["📈 PASAR (harga · OI · Stoch · TF 4H/1D/1W)"]
+    for r in market_rows:
+        price = fmt_usd(r["price"]) if r.get("price") is not None else "—"
+        chg = f"  {fmt_pct(r['change_24h'])}" if r.get("change_24h") is not None else ""
+        oi = fmt_usd(r["oi_usd"]) if r.get("oi_usd") is not None else "—"
+        k = r.get("stoch_k")
+        stoch = f"{k:.0f} {r.get('stoch_label', '')}" if k is not None else "—"
+        tf = (f"4H{_TREND_ARROW.get(r.get('trend_4h', '—'), '—')} "
+              f"1D{_TREND_ARROW.get(r.get('trend_1d', '—'), '—')} "
+              f"1W{_TREND_ARROW.get(r.get('trend_1w', '—'), '—')}")
+        m_lines.append(f"• {r['symbol']} {price}{chg}\n"
+                       f"   OI {oi} · Stoch {stoch} · {tf}")
+    blok_market = "\n".join(m_lines)
 
-    # BLOK D — action summary, maks 3 baris
-    actionable = [g for g in groups[:5] if g.level in ("REVIEW", "RISK_OFF", "OPPORTUNITY")]
-    monitor = [g for g in groups[:5] if g.level == "MONITOR"]
-    d_lines = ["✅ AKSI HARI INI:"]
-    n = 0
-    for g in actionable:
-        n += 1
-        idx = groups.index(g) + 1
-        verb = "Review posisi" if g.level in ("REVIEW", "RISK_OFF") else "Riset kandidat"
-        d_lines.append(f"{n}. {LEVEL_EMOJI[g.level]} {verb} {g.entity} (lihat C-{idx})")
-        if n == 2:
-            break
-    if n < 3 and monitor and n > 0:
-        n += 1
-        g = monitor[0]
-        d_lines.append(f"{n}. 🟡 Pasang alert {g.entity} pada level pembatal (lihat C-{groups.index(g) + 1})")
-    if n == 0:
-        d_lines = ["✅ AKSI HARI INI:\nTidak ada aksi hari ini — semua sinyal level INFO/MONITOR."]
-        blok_d = d_lines[0]
+    # 6) Fundamental HYPE & LIT
+    if fundamentals:
+        f_lines = ["💎 VALUASI (HYPE & LIT)"]
+        for v in fundamentals:
+            mc = fmt_usd(v["market_cap"]) if v.get("market_cap") else "—"
+            tvl = fmt_usd(v["tvl"]) if v.get("tvl") else "—"
+            rev = fmt_usd(v["revenue_annual"]) if v.get("revenue_annual") else "—"
+            fee = fmt_usd(v["fees_annual"]) if v.get("fees_annual") else "—"
+            pf = v.get("pf"); ps = v.get("ps"); pe = v.get("pe")
+            ratios = " · ".join(x for x in [
+                f"P/F {pf}" if pf is not None else None,
+                f"P/S {ps}" if ps is not None else None,
+                f"P/E {pe}" if pe is not None else None] if x)
+            f_lines.append(f"• {v['symbol']}  MC {mc} · TVL {tvl}\n"
+                           f"   Rev/th {rev} · Fee/th {fee} · {ratios}\n"
+                           f"   → {v.get('verdict', '—')}")
+        blok_fund = "\n".join(f_lines)
     else:
-        d_lines.append(f"{n + 1}. ⚪ Tidak ada aksi lain. Sisanya konteks.")
-        blok_d = "\n".join(d_lines[:4])
+        blok_fund = "💎 VALUASI (HYPE & LIT): data belum lengkap"
 
-    # BLOK E — radar 24 jam
-    blok_e = "👀 DIPANTAU: " + (" · ".join(radar_lines) if radar_lines
-                                else "tidak ada agenda khusus — modul berjalan sesuai jadwal")
-
-    return "\n\n".join([blok_a, blok_b, blok_c, blok_d, blok_e, FOOTER])
+    return "\n\n".join([blok_header, blok_fng, blok_market, blok_fund, FOOTER])
 
 
 def format_realtime_alert(g: SignalGroup, arti: str, now_wib: datetime) -> str:

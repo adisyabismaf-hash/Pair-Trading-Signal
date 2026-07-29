@@ -62,6 +62,67 @@ def build_snapshot(session: Session, watchlist: Watchlist) -> dict:
     }
 
 
+# Assets that get a fundamentals/valuation block (symbol -> DeFiLlama slug).
+FUNDAMENTAL_ASSETS = {"HYPE": "hyperliquid", "LIT": "lighter"}
+
+
+def _latest_price(session: Session, coingecko_id: str):
+    return session.execute(
+        select(models.PriceSnapshot).where(models.PriceSnapshot.coingecko_id == coingecko_id)
+        .order_by(desc(models.PriceSnapshot.fetched_at)).limit(1)).scalars().first()
+
+
+def build_market_rows(session: Session, watchlist: Watchlist) -> list[dict]:
+    """Per watchlist asset: price + 24h change (CoinGecko DB), OI (Extended), and
+    Stochastic + market-structure trend on 4H/1D/1W (Extended candles)."""
+    from app.engine import technicals
+    from app.fetchers import extended
+
+    rows = []
+    for a in watchlist.assets:
+        market = f"{a.symbol}-USD"
+        pr = _latest_price(session, a.coingecko_id)
+        oi_usd = None
+        try:
+            stats, _url, _s = extended.fetch_market_stats(market)
+            oi_usd = float(stats.get("openInterest") or 0) or None
+        except Exception as exc:
+            logger.warning("OI fetch failed for %s: %s", market, exc)
+        tech = technicals.analyze_asset(market)
+        rows.append({
+            "symbol": a.symbol,
+            "price": pr.price_usd if pr else None,
+            "change_24h": pr.change_24h_pct if pr else None,
+            "oi_usd": oi_usd,
+            "stoch_k": tech.get("stoch_k"), "stoch_label": tech.get("stoch_label", "—"),
+            "trend_4h": tech.get("trend_4h", "—"), "trend_1d": tech.get("trend_1d", "—"),
+            "trend_1w": tech.get("trend_1w", "—"),
+        })
+    return rows
+
+
+def build_fundamentals(session: Session, watchlist: Watchlist) -> list[dict]:
+    """Valuation block for HYPE & LIT: market cap (CoinGecko DB) + TVL (DeFiLlama DB) +
+    live fees/revenue/earnings -> P/F, P/S, P/E."""
+    from app.engine import valuation
+
+    out = []
+    for a in watchlist.assets:
+        slug = FUNDAMENTAL_ASSETS.get(a.symbol.upper())
+        if not slug:
+            continue
+        pr = _latest_price(session, a.coingecko_id)
+        mcap = pr.market_cap if pr else None
+        tvl_row = session.execute(
+            select(models.TvlSnapshot).where(models.TvlSnapshot.entity == slug)
+            .order_by(desc(models.TvlSnapshot.fetched_at)).limit(1)).scalars().first()
+        tvl = tvl_row.tvl_usd if tvl_row else None
+        v = valuation.valuation(slug, mcap, tvl)
+        v["symbol"] = a.symbol
+        out.append(v)
+    return out
+
+
 def _log_alert(session: Session, kind: str, text: str, notifier: Notifier,
                level: str | None = None, entity: str | None = None,
                invalidation: str | None = None) -> models.AlertLog:
@@ -78,9 +139,10 @@ def send_daily_outlook(session: Session, rules: ActionRules, watchlist: Watchlis
                        positions: list[Position], settings: Settings,
                        notifier: Notifier) -> str:
     now = _now_wib()
-    groups = run_signal_engine(session, rules, watchlist, positions)
     score, label, comps = compute_regime(session, rules, watchlist)
     snapshot = build_snapshot(session, watchlist)
+    market_rows = build_market_rows(session, watchlist)
+    fundamentals = build_fundamentals(session, watchlist)
 
     prev = session.execute(select(models.DailyOutlook)
                            .order_by(desc(models.DailyOutlook.outlook_date))
@@ -88,16 +150,11 @@ def send_daily_outlook(session: Session, rules: ActionRules, watchlist: Watchlis
     prev_score = prev.regime_score if prev and prev.outlook_date != now.strftime("%Y-%m-%d") else \
         (prev.regime_score if prev else None)
 
-    payload = narrator.build_payload(groups, (score, label, comps), snapshot)
-    narasi, llm_used = narrator.narrate(payload, rules, settings)
-    arti_map = {g.entity: narasi["arti"].get(g.entity) or narrator.template_arti(g)
-                for g in groups}
-
-    radar = [f"{g.entity}: menunggu trigger '{g.events[-1].invalidation[:60]}'"
-             for g in groups if g.level == "MONITOR"][:2]
-
     text = formatter.format_daily_outlook(now, (score, label), prev_score,
-                                          snapshot, groups, arti_map, radar)
+                                          snapshot, market_rows, fundamentals)
+    payload = {"score": score, "label": label, "market_rows": market_rows,
+               "fundamentals": fundamentals}
+    llm_used = False
 
     date_str = now.strftime("%Y-%m-%d")
     existing = session.execute(select(models.DailyOutlook)
