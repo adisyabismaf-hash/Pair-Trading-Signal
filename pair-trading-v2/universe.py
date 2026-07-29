@@ -76,6 +76,21 @@ SPREAD_PAIRS = [
 ]
 
 
+# Symbols that are economically the SAME underlying asset (just different wrapper/venue).
+# A pair between two members is a wrapper/venue spread, not a diversified pair trade, so
+# the "Recommended" Telegram list skips them (e.g. PAXG vs XAUT are both tokenized gold).
+SAME_ASSET_GROUPS = {
+    "gold": {"XAU", "PAXG", "XAUT"},
+    "oil": {"WTI", "BRENT"},
+}
+
+
+def same_underlying(symbol_a: str, symbol_b: str) -> bool:
+    """True if both symbols are the same underlying asset in different wrappers/venues."""
+    return any(symbol_a in members and symbol_b in members
+               for members in SAME_ASSET_GROUPS.values())
+
+
 def build_symbol_table():
     """Flat dict symbol -> (source, source_ticker) across every configured universe."""
     table = {}

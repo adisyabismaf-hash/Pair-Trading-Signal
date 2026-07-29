@@ -122,6 +122,26 @@ def _close_trade(pair_label, position, i, prices, symbol_a, symbol_b, reason) ->
     )
 
 
+def current_zscore(prices: pd.DataFrame, symbol_a: str, symbol_b: str,
+                   lookback_days: int = 60) -> float | None:
+    """Latest spread z-score for A vs B, using the same OLS-hedge-ratio model as the
+    backtest evaluated at the most recent aligned day. Returns None if there isn't enough
+    overlapping history or the spread has ~zero variance."""
+    pair = prices[[symbol_a, symbol_b]].dropna()
+    if len(pair) < lookback_days + 1:
+        return None
+    la = np.log(pair[symbol_a].values)
+    lb = np.log(pair[symbol_b].values)
+    i = len(pair) - 1
+    wa, wb = la[i - lookback_days:i], lb[i - lookback_days:i]
+    h = np.polyfit(wb, wa, 1)[0]
+    spread_window = wa - h * wb
+    mu, sigma = spread_window.mean(), spread_window.std(ddof=1)
+    if sigma <= 1e-12:
+        return None
+    return float((la[i] - h * lb[i] - mu) / sigma)
+
+
 def summarize_trades(trades: list[PairTrade]) -> pd.DataFrame:
     if not trades:
         return pd.DataFrame(columns=["pair", "trades", "win_rate_pct", "avg_pnl_pct",

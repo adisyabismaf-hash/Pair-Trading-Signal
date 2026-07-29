@@ -881,41 +881,15 @@ def _load_v2():
     return v2_pipeline, v2_universe
 
 
-def _build_recommendations(res, v2_universe, watched_pairs) -> list[dict]:
-    table = v2_universe.build_symbol_table()
+def _build_recommendations(res, v2_pipeline, watched_pairs) -> list[dict]:
     watched = set()
     for p in watched_pairs:
         watched.add((p.base_market, p.quote_market))
         watched.add((p.quote_market, p.base_market))
-    items = []
-    for row in res.qualified.itertuples():
-        src_a, tick_a = table.get(row.symbol_a, (None, None))
-        src_b, tick_b = table.get(row.symbol_b, (None, None))
-        addable = src_a == "extended" and src_b == "extended"
-        items.append({
-            "symbol_a": row.symbol_a, "symbol_b": row.symbol_b,
-            "corr_level": float(row.corr_level), "corr_returns": float(row.corr_returns),
-            "base_market": tick_a if addable else None,
-            "quote_market": tick_b if addable else None,
-            "addable": addable, "source_a": src_a, "source_b": src_b,
-            "in_watchlist": addable and (tick_a, tick_b) in watched,
-        })
+    items = v2_pipeline.build_reco_items(res)
+    for it in items:
+        it["in_watchlist"] = it["addable"] and (it["base_market"], it["quote_market"]) in watched
     return items
-
-
-def _format_reco_telegram(items: list[dict], threshold: float) -> str:
-    lines = ["⭐ <b>REKOMENDASI PAIR TRADING</b>",
-             f"Pair dengan |korelasi| ≥ {threshold:.2f} (scan multi-venue):", ""]
-    for it in items[:15]:
-        wl = " 👁️" if it.get("in_watchlist") else ""
-        ext = "" if it["addable"] else " (di luar Extended)"
-        lines.append(f"• <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
-                     f"level {it['corr_level']:+.3f}, returns {it['corr_returns']:+.3f}{ext}{wl}")
-    if len(items) > 15:
-        lines.append(f"… dan {len(items) - 15} pair lainnya")
-    lines += ["", "Tambahkan ke watchlist lewat halaman ⭐ Recommended untuk mulai "
-              "memantau sinyal z-score-nya."]
-    return "\n".join(lines)
 
 
 def page_recommended():
@@ -963,7 +937,7 @@ def page_recommended():
         watched_pairs = db.execute(select(WatchedPair)).scalars().all()
     finally:
         db.close()
-    items = _build_recommendations(res, v2_universe, watched_pairs)
+    items = _build_recommendations(res, v2_pipeline, watched_pairs)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Pair Lolos", len(items))
@@ -980,16 +954,38 @@ def page_recommended():
             return "👁️ Dipantau"
         return "🟦 Kandidat" if i["addable"] else "⬜ Di luar Extended"
 
+    def signal_of(i):
+        z = i.get("zscore")
+        if z is None:
+            return "—"
+        if z >= 2:
+            return "🔴 SHORT spread"
+        if z <= -2:
+            return "🟢 LONG spread"
+        return ""
+
+    st.markdown("#### 🏆 Top 5 (aset berbeda) — yang dikirim ke Telegram")
+    top5 = v2_pipeline.top_recommendations(items, 5)
     st.dataframe(pd.DataFrame([{
+        "#": n,
         "Pair": f"{i['symbol_a']} vs {i['symbol_b']}",
-        "Korelasi Level": round(i["corr_level"], 3),
-        "Korelasi Returns": round(i["corr_returns"], 3),
-        "Sumber": f"{i['source_a']} / {i['source_b']}",
-        "Status": status_of(i),
-    } for i in items]), width="stretch", hide_index=True)
-    st.caption("💡 Korelasi **level** tinggi tapi **returns** rendah = dua aset kebetulan "
-               "sama-sama naik, bukan edge trading. Pair di luar Extended (Brent, PAXG, XAUT) "
-               "tidak bisa dipantau live oleh engine ini.")
+        "Korelasi": round(i["corr_level"], 3),
+        "Z-score": None if i.get("zscore") is None else round(i["zscore"], 2),
+        "Sinyal": signal_of(i),
+    } for n, i in enumerate(top5, 1)]), width="stretch", hide_index=True)
+
+    with st.expander(f"Lihat semua {len(items)} pair yang lolos korelasi"):
+        st.dataframe(pd.DataFrame([{
+            "Pair": f"{i['symbol_a']} vs {i['symbol_b']}",
+            "Korelasi Level": round(i["corr_level"], 3),
+            "Korelasi Returns": round(i["corr_returns"], 3),
+            "Z-score": None if i.get("zscore") is None else round(i["zscore"], 2),
+            "Aset sama?": "ya" if i.get("same_underlying") else "",
+            "Sumber": f"{i['source_a']} / {i['source_b']}",
+            "Status": status_of(i),
+        } for i in items]), width="stretch", hide_index=True)
+    st.caption("💡 Z-score ≥ +2 → spread mahal (SHORT spread); ≤ −2 → spread murah (LONG spread). "
+               "Pair 'aset sama' (PAXG/XAUT dll) & di luar Extended dilewati dari Top 5.")
 
     st.divider()
     col_add, col_tg = st.columns(2)
@@ -1029,10 +1025,8 @@ def page_recommended():
                    "saja yang bisa masuk watchlist.")
         if st.button("📨 Kirim Sekarang", key="reco_tg"):
             ok = telegram_notifier.send_message(
-                _format_reco_telegram(items, cache["threshold"]))
-            st.session_state["notice"] = (
-                f"📨 Rekomendasi {len(items)} pair terkirim ke Telegram." if ok
-                else "")
+                v2_pipeline.format_reco_telegram(items, cache["threshold"]))
+            st.session_state["notice"] = "📨 Top 5 rekomendasi terkirim ke Telegram." if ok else ""
             if not ok:
                 st.session_state["notice_err"] = "❌ Telegram gagal — cek token/chat ID."
             st.rerun()

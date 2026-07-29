@@ -103,6 +103,74 @@ def resolve_symbol_specs(universe_names: list[str]) -> list[tuple[str, str, str]
     return specs
 
 
+def build_reco_items(result: "ScanResult", lookback: int = 60) -> list[dict]:
+    """Turn a correlation scan into recommendation dicts, each enriched with the pair's
+    current spread z-score and a same-underlying flag. Callers add DB-specific fields
+    (e.g. in_watchlist) afterwards."""
+    from analytics import current_zscore
+    from universe import build_symbol_table, same_underlying
+
+    table = build_symbol_table()
+    items = []
+    for row in result.qualified.itertuples():
+        src_a, tick_a = table.get(row.symbol_a, (None, None))
+        src_b, tick_b = table.get(row.symbol_b, (None, None))
+        addable = src_a == "extended" and src_b == "extended"
+        try:
+            z = current_zscore(result.aligned, row.symbol_a, row.symbol_b, lookback)
+        except Exception:
+            z = None
+        items.append({
+            "symbol_a": row.symbol_a, "symbol_b": row.symbol_b,
+            "corr_level": float(row.corr_level), "corr_returns": float(row.corr_returns),
+            "zscore": z, "same_underlying": same_underlying(row.symbol_a, row.symbol_b),
+            "base_market": tick_a if addable else None,
+            "quote_market": tick_b if addable else None,
+            "addable": addable, "source_a": src_a, "source_b": src_b,
+        })
+    return items
+
+
+def top_recommendations(items: list[dict], limit: int = 5) -> list[dict]:
+    """Best `limit` pairs by |correlation|, excluding same-underlying wrapper pairs
+    (e.g. PAXG/XAUT are both gold)."""
+    diversified = [i for i in items if not i.get("same_underlying")]
+    diversified.sort(key=lambda i: abs(i["corr_level"]), reverse=True)
+    return diversified[:limit]
+
+
+def signal_for(z: float | None, signal_z: float = 2.0) -> str:
+    """Signal label for a spread z-score, or '' if within band / unknown."""
+    if z is None:
+        return ""
+    if z >= signal_z:
+        return " 🔴 SINYAL: SHORT spread (short A / long B)"
+    if z <= -signal_z:
+        return " 🟢 SINYAL: LONG spread (long A / short B)"
+    return ""
+
+
+def format_reco_telegram(items: list[dict], threshold: float, *,
+                         limit: int = 5, signal_z: float = 2.0) -> str:
+    """Telegram message: top `limit` diversified pairs with correlation, z-score, and a
+    signal flag when |z| >= signal_z."""
+    top = top_recommendations(items, limit)
+    lines = ["⭐ <b>REKOMENDASI PAIR TRADING</b>",
+             f"Top {limit} korelasi {threshold:.2f}–1.00 (aset berbeda):", ""]
+    for n, it in enumerate(top, 1):
+        z = it.get("zscore")
+        ztxt = f"z {z:+.2f}" if z is not None else "z —"
+        wl = " 👁️" if it.get("in_watchlist") else ""
+        lines.append(f"{n}. <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
+                     f"korelasi {it['corr_level']:.2f} · {ztxt}{wl}{signal_for(z, signal_z)}")
+    signals = [it for it in top if signal_for(it.get("zscore"), signal_z)]
+    if signals:
+        lines += ["", f"⚡ {len(signals)} pair di zona entry (|z| ≥ {signal_z:.0f})."]
+    else:
+        lines += ["", f"Belum ada yang tembus |z| ≥ {signal_z:.0f} — pantau saja dulu."]
+    return "\n".join(lines)
+
+
 def scan_pipeline(universe_names: list[str], *,
                   corr_threshold: float = settings.corr_threshold,
                   corr_method: str = settings.corr_method,
