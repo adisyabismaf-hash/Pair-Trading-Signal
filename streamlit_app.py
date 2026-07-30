@@ -959,9 +959,9 @@ def page_recommended():
         if z is None:
             return "—"
         if z >= 2:
-            return "🔴 SHORT spread"
+            return f"🔴 SHORT {i['symbol_a']} / LONG {i['symbol_b']}"
         if z <= -2:
-            return "🟢 LONG spread"
+            return f"🟢 LONG {i['symbol_a']} / SHORT {i['symbol_b']}"
         return ""
 
     st.markdown("#### 🏆 Top 5 (aset berbeda) — yang dikirim ke Telegram")

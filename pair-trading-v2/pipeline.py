@@ -139,33 +139,46 @@ def top_recommendations(items: list[dict], limit: int = 5) -> list[dict]:
     return diversified[:limit]
 
 
-def signal_for(z: float | None, signal_z: float = 2.0) -> str:
-    """Signal label for a spread z-score, or '' if within band / unknown."""
+def signal_legs(symbol_a: str, symbol_b: str, z: float | None,
+                signal_z: float = 2.0) -> str:
+    """Explicit long/short legs when the spread z-score is at an entry extreme, else ''.
+
+    spread = log(A) - h·log(B):
+      z >= +signal_z -> spread mahal -> SHORT A / LONG B
+      z <= -signal_z -> spread murah -> LONG A / SHORT B
+    """
     if z is None:
         return ""
     if z >= signal_z:
-        return " 🔴 SINYAL: SHORT spread (short A / long B)"
+        return f"🔴 SHORT {symbol_a} / LONG {symbol_b}"
     if z <= -signal_z:
-        return " 🟢 SINYAL: LONG spread (long A / short B)"
+        return f"🟢 LONG {symbol_a} / SHORT {symbol_b}"
     return ""
 
 
 def format_reco_telegram(items: list[dict], threshold: float, *,
                          limit: int = 5, signal_z: float = 2.0) -> str:
-    """Telegram message: top `limit` diversified pairs with correlation, z-score, and a
-    signal flag when |z| >= signal_z."""
+    """Telegram message: top `limit` diversified pairs with correlation, z-score, and —
+    for any pair whose |z| >= signal_z — an explicit long/short signal (e.g. LONG ETH /
+    SHORT BTC)."""
     top = top_recommendations(items, limit)
     lines = ["⭐ <b>REKOMENDASI PAIR TRADING</b>",
              f"Top {limit} korelasi {threshold:.2f}–1.00 (aset berbeda):", ""]
+    signals = []
     for n, it in enumerate(top, 1):
         z = it.get("zscore")
         ztxt = f"z {z:+.2f}" if z is not None else "z —"
         wl = " 👁️" if it.get("in_watchlist") else ""
-        lines.append(f"{n}. <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
-                     f"korelasi {it['corr_level']:.2f} · {ztxt}{wl}{signal_for(z, signal_z)}")
-    signals = [it for it in top if signal_for(it.get("zscore"), signal_z)]
+        legs = signal_legs(it["symbol_a"], it["symbol_b"], z, signal_z)
+        line = (f"{n}. <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
+                f"korelasi {it['corr_level']:.2f} · {ztxt}{wl}")
+        if legs:
+            line += f"\n   → SINYAL: {legs}"
+            signals.append((it, legs))
+        lines.append(line)
     if signals:
-        lines += ["", f"⚡ {len(signals)} pair di zona entry (|z| ≥ {signal_z:.0f})."]
+        lines += ["", f"⚡ {len(signals)} pair di zona entry (|z| ≥ {signal_z:.0f}):"]
+        lines += [f"• {legs}" for _it, legs in signals]
     else:
         lines += ["", f"Belum ada yang tembus |z| ≥ {signal_z:.0f} — pantau saja dulu."]
     return "\n".join(lines)
