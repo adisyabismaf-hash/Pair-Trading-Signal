@@ -1024,9 +1024,10 @@ def page_recommended():
         st.caption("Kirim daftar rekomendasi ini ke Telegram sebagai sinyal pair apa "
                    "saja yang bisa masuk watchlist.")
         if st.button("📨 Kirim Sekarang", key="reco_tg"):
+            focus = v2_pipeline.build_focus_items(res, "BTC")  # BTC pairs incl. BTC/ETH
             ok = telegram_notifier.send_message(
-                v2_pipeline.format_reco_telegram(items, cache["threshold"]))
-            st.session_state["notice"] = "📨 Top 5 rekomendasi terkirim ke Telegram." if ok else ""
+                v2_pipeline.format_reco_telegram(items, cache["threshold"], focus_items=focus))
+            st.session_state["notice"] = "📨 Top 5 + pair BTC terkirim ke Telegram." if ok else ""
             if not ok:
                 st.session_state["notice_err"] = "❌ Telegram gagal — cek token/chat ID."
             st.rerun()

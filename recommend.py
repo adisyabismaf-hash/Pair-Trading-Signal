@@ -18,6 +18,7 @@ logger = logging.getLogger("recommend")
 ROOT = Path(__file__).resolve().parent
 V2_DIR = os.path.abspath(os.environ.get("V2_DIR", str(ROOT / "pair-trading-v2")))
 THRESHOLD = float(os.environ.get("RECO_CORR_THRESHOLD", "0.90"))
+FOCUS_SYMBOL = os.environ.get("RECO_FOCUS_SYMBOL", "BTC")
 
 
 def main() -> int:
@@ -41,6 +42,7 @@ def main() -> int:
         return 1
 
     items = v2_pipeline.build_reco_items(res)
+    focus = v2_pipeline.build_focus_items(res, FOCUS_SYMBOL)  # BTC pairs, incl. BTC/ETH
     db = SessionLocal()
     try:
         watched = set()
@@ -49,16 +51,18 @@ def main() -> int:
             watched.add((p.quote_market, p.base_market))
     finally:
         db.close()
-    for it in items:
+    for it in items + focus:
         it["in_watchlist"] = it["addable"] and (it["base_market"], it["quote_market"]) in watched
 
-    if not items:
+    if not items and not focus:
         logger.info("No pairs qualified >= %.2f; nothing to send.", THRESHOLD)
         return 0
 
     ok = telegram_notifier.send_message(
-        v2_pipeline.format_reco_telegram(items, THRESHOLD))
-    logger.info("Recommendation push: %d pairs (top 5 sent), telegram sent=%s", len(items), ok)
+        v2_pipeline.format_reco_telegram(items, THRESHOLD, focus_symbol=FOCUS_SYMBOL,
+                                         focus_items=focus))
+    logger.info("Recommendation push: %d pairs (top 5 + %d %s pairs), telegram sent=%s",
+                len(items), len(focus), FOCUS_SYMBOL, ok)
     return 0
 
 

@@ -156,29 +156,107 @@ def signal_legs(symbol_a: str, symbol_b: str, z: float | None,
     return ""
 
 
+def pairs_with_symbol(items: list[dict], symbol: str) -> list[dict]:
+    """Every qualifying pair that has `symbol` as one leg, sorted by |correlation| desc."""
+    s = symbol.upper()
+    out = [i for i in items if s in (i["symbol_a"].upper(), i["symbol_b"].upper())]
+    out.sort(key=lambda i: abs(i["corr_level"]), reverse=True)
+    return out
+
+
+def build_focus_items(result: "ScanResult", symbol: str, lookback: int = 60) -> list[dict]:
+    """Reco items for EVERY pair involving `symbol`, taken from the full correlation
+    matrix (not just pairs above the screening threshold) so a named reference pair like
+    BTC/ETH is available even when its correlation dips below the cutoff. Sorted by
+    |correlation| desc."""
+    from analytics import current_zscore
+    from universe import build_symbol_table, same_underlying
+
+    if symbol not in result.corr_level.columns:
+        return []
+    table = build_symbol_table()
+    out = []
+    for other in result.corr_level.columns:
+        if other == symbol:
+            continue
+        cl = result.corr_level.loc[symbol, other]
+        if pd.isna(cl):
+            continue
+        cr = result.corr_returns.loc[symbol, other]
+        src_a, tick_a = table.get(symbol, (None, None))
+        src_b, tick_b = table.get(other, (None, None))
+        addable = src_a == "extended" and src_b == "extended"
+        try:
+            z = current_zscore(result.aligned, symbol, other, lookback)
+        except Exception:
+            z = None
+        out.append({
+            "symbol_a": symbol, "symbol_b": other,
+            "corr_level": float(cl), "corr_returns": float(cr) if not pd.isna(cr) else None,
+            "zscore": z, "same_underlying": same_underlying(symbol, other),
+            "base_market": tick_a if addable else None,
+            "quote_market": tick_b if addable else None,
+            "addable": addable, "source_a": src_a, "source_b": src_b,
+        })
+    out.sort(key=lambda i: abs(i["corr_level"]), reverse=True)
+    return out
+
+
+def _reco_line(it: dict, signal_z: float, signals: list) -> str:
+    """One bullet: pair, correlation, z-score, and an explicit long/short leg if |z|>=z."""
+    z = it.get("zscore")
+    ztxt = f"z {z:+.2f}" if z is not None else "z —"
+    wl = " 👁️" if it.get("in_watchlist") else ""
+    legs = signal_legs(it["symbol_a"], it["symbol_b"], z, signal_z)
+    line = f"• <b>{it['symbol_a']}/{it['symbol_b']}</b> — korelasi {it['corr_level']:.2f} · {ztxt}{wl}"
+    if legs:
+        line += f"\n   → SINYAL: {legs}"
+        signals.append(legs)
+    return line
+
+
+# Reference pairs always shown in the focus section even if correlation dips below the
+# screening threshold (user asked for BTC/ETH explicitly).
+PINNED_PAIRS = {frozenset(("BTC", "ETH"))}
+
+
 def format_reco_telegram(items: list[dict], threshold: float, *,
-                         limit: int = 5, signal_z: float = 2.0) -> str:
-    """Telegram message: top `limit` diversified pairs with correlation, z-score, and —
-    for any pair whose |z| >= signal_z — an explicit long/short signal (e.g. LONG ETH /
-    SHORT BTC)."""
+                         limit: int = 5, signal_z: float = 2.0,
+                         focus_symbol: str = "BTC",
+                         focus_items: list[dict] | None = None) -> str:
+    """Telegram message: top `limit` diversified pairs, then a dedicated section for every
+    pair involving `focus_symbol` (default BTC), each with correlation, z-score, and an
+    explicit long/short signal when |z| >= signal_z.
+
+    `focus_items` (from build_focus_items) lets the focus section include pairs below the
+    threshold — used to always show BTC/ETH. Without it, the section falls back to the
+    focus-symbol pairs already in `items` (i.e. only those >= threshold)."""
     top = top_recommendations(items, limit)
+    signals: list[str] = []
+
     lines = ["⭐ <b>REKOMENDASI PAIR TRADING</b>",
              f"Top {limit} korelasi {threshold:.2f}–1.00 (aset berbeda):", ""]
-    signals = []
     for n, it in enumerate(top, 1):
-        z = it.get("zscore")
-        ztxt = f"z {z:+.2f}" if z is not None else "z —"
-        wl = " 👁️" if it.get("in_watchlist") else ""
-        legs = signal_legs(it["symbol_a"], it["symbol_b"], z, signal_z)
-        line = (f"{n}. <b>{it['symbol_a']}/{it['symbol_b']}</b> — "
-                f"korelasi {it['corr_level']:.2f} · {ztxt}{wl}")
-        if legs:
-            line += f"\n   → SINYAL: {legs}"
-            signals.append((it, legs))
-        lines.append(line)
+        lines.append(f"{n}. " + _reco_line(it, signal_z, signals)[2:])  # drop leading "• "
+
+    # Focus-symbol section (BTC pairs): threshold-passing pairs + any pinned reference
+    # pair (BTC/ETH), skipping ones already listed in the top block.
+    pool = focus_items if focus_items is not None else pairs_with_symbol(items, focus_symbol)
+    top_keys = {frozenset((it["symbol_a"], it["symbol_b"])) for it in top}
+    focus = []
+    for it in pool:
+        key = frozenset((it["symbol_a"], it["symbol_b"]))
+        if key in top_keys:
+            continue
+        if abs(it["corr_level"]) >= threshold or key in PINNED_PAIRS:
+            focus.append(it)
+    if focus:
+        lines += ["", f"₿ Pair {focus_symbol}:"]
+        lines += [_reco_line(it, signal_z, signals) for it in focus]
+
     if signals:
         lines += ["", f"⚡ {len(signals)} pair di zona entry (|z| ≥ {signal_z:.0f}):"]
-        lines += [f"• {legs}" for _it, legs in signals]
+        lines += [f"• {legs}" for legs in signals]
     else:
         lines += ["", f"Belum ada yang tembus |z| ≥ {signal_z:.0f} — pantau saja dulu."]
     return "\n".join(lines)
