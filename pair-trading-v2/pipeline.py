@@ -103,6 +103,26 @@ def resolve_symbol_specs(universe_names: list[str]) -> list[tuple[str, str, str]
     return specs
 
 
+RISK_EMOJI = {"Low": "🟢", "Moderate": "🟡", "High": "🔴"}
+
+
+def risk_rating(corr_level: float | None, corr_returns: float | None) -> str:
+    """Low / Moderate / High trading risk from the two correlations.
+
+    Returns correlation (day-to-day co-movement) is the honest measure, so it sets the
+    base tier. A large gap where the level correlation is much higher than the returns
+    correlation means the headline number overstates the relationship (two things merely
+    trending together) — that bumps the risk up one tier."""
+    # Round to the 2 decimals the UI shows so the rating never contradicts the number
+    # a user sees (e.g. displayed "returns 0.80" always rates as the >=0.80 tier).
+    lv = round(abs(corr_level), 2) if corr_level is not None else 0.0
+    rt = round(abs(corr_returns), 2) if corr_returns is not None else 0.0
+    tier = 0 if rt >= 0.80 else (1 if rt >= 0.60 else 2)   # Low / Moderate / High
+    if lv - rt >= 0.25:                                     # level overstates the link
+        tier = min(2, tier + 1)
+    return ("Low", "Moderate", "High")[tier]
+
+
 def build_reco_items(result: "ScanResult", lookback: int = 60) -> list[dict]:
     """Turn a correlation scan into recommendation dicts, each enriched with the pair's
     current spread z-score and a same-underlying flag. Callers add DB-specific fields
@@ -123,6 +143,7 @@ def build_reco_items(result: "ScanResult", lookback: int = 60) -> list[dict]:
         items.append({
             "symbol_a": row.symbol_a, "symbol_b": row.symbol_b,
             "corr_level": float(row.corr_level), "corr_returns": float(row.corr_returns),
+            "risk": risk_rating(row.corr_level, row.corr_returns),
             "zscore": z, "same_underlying": same_underlying(row.symbol_a, row.symbol_b),
             "base_market": tick_a if addable else None,
             "quote_market": tick_b if addable else None,
@@ -190,9 +211,11 @@ def build_focus_items(result: "ScanResult", symbol: str, lookback: int = 60) -> 
             z = current_zscore(result.aligned, symbol, other, lookback)
         except Exception:
             z = None
+        cr_val = float(cr) if not pd.isna(cr) else None
         out.append({
             "symbol_a": symbol, "symbol_b": other,
-            "corr_level": float(cl), "corr_returns": float(cr) if not pd.isna(cr) else None,
+            "corr_level": float(cl), "corr_returns": cr_val,
+            "risk": risk_rating(float(cl), cr_val),
             "zscore": z, "same_underlying": same_underlying(symbol, other),
             "base_market": tick_a if addable else None,
             "quote_market": tick_b if addable else None,
@@ -203,12 +226,18 @@ def build_focus_items(result: "ScanResult", symbol: str, lookback: int = 60) -> 
 
 
 def _reco_line(it: dict, signal_z: float, signals: list) -> str:
-    """One bullet: pair, correlation, z-score, and an explicit long/short leg if |z|>=z."""
+    """One bullet: pair + z-score, then both correlations and a risk rating, plus an
+    explicit long/short leg if |z| >= signal_z."""
     z = it.get("zscore")
     ztxt = f"z {z:+.2f}" if z is not None else "z —"
     wl = " 👁️" if it.get("in_watchlist") else ""
+    cr = it.get("corr_returns")
+    ret = f"{cr:.2f}" if cr is not None else "—"
+    risk = it.get("risk", "—")
+    remoji = RISK_EMOJI.get(risk, "")
+    line = (f"• <b>{it['symbol_a']}/{it['symbol_b']}</b> · {ztxt}{wl}\n"
+            f"   korelasi {it['corr_level']:.2f} · returns {ret} · risiko {remoji} {risk}")
     legs = signal_legs(it["symbol_a"], it["symbol_b"], z, signal_z)
-    line = f"• <b>{it['symbol_a']}/{it['symbol_b']}</b> — korelasi {it['corr_level']:.2f} · {ztxt}{wl}"
     if legs:
         line += f"\n   → SINYAL: {legs}"
         signals.append(legs)

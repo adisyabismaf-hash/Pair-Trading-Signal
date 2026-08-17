@@ -970,6 +970,8 @@ def page_recommended():
         "#": n,
         "Pair": f"{i['symbol_a']} vs {i['symbol_b']}",
         "Korelasi": round(i["corr_level"], 3),
+        "Returns": None if i.get("corr_returns") is None else round(i["corr_returns"], 3),
+        "Risiko": f"{v2_pipeline.RISK_EMOJI.get(i.get('risk'), '')} {i.get('risk', '—')}",
         "Z-score": None if i.get("zscore") is None else round(i["zscore"], 2),
         "Sinyal": signal_of(i),
     } for n, i in enumerate(top5, 1)]), width="stretch", hide_index=True)
@@ -978,7 +980,8 @@ def page_recommended():
         st.dataframe(pd.DataFrame([{
             "Pair": f"{i['symbol_a']} vs {i['symbol_b']}",
             "Korelasi Level": round(i["corr_level"], 3),
-            "Korelasi Returns": round(i["corr_returns"], 3),
+            "Korelasi Returns": None if i.get("corr_returns") is None else round(i["corr_returns"], 3),
+            "Risiko": f"{v2_pipeline.RISK_EMOJI.get(i.get('risk'), '')} {i.get('risk', '—')}",
             "Z-score": None if i.get("zscore") is None else round(i["zscore"], 2),
             "Aset sama?": "ya" if i.get("same_underlying") else "",
             "Sumber": f"{i['source_a']} / {i['source_b']}",
