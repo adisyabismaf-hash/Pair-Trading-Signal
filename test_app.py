@@ -5,8 +5,8 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
 os.environ.setdefault("DATABASE_URL", "postgresql://pairtrader:***PASSWORD_REMOVED***@localhost:5432/trading_signals")
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "***TOKEN_REMOVED***")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "403542902")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+os.environ.setdefault("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
 os.environ.setdefault("EXTENDED_BASE_URL", "https://api.starknet.extended.exchange")
 
 from streamlit.testing.v1 import AppTest
