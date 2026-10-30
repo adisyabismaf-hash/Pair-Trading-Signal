@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, DateTime, Enum, Float, Integer, JSON, String, Text, UniqueConstraint,
+    BigInteger, Boolean, DateTime, Enum, Float, Integer, JSON, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -115,4 +115,18 @@ class ScanLog(Base):
     signals_created: Mapped[int] = mapped_column(Integer, default=0)
     signals_closed: Mapped[int] = mapped_column(Integer, default=0)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class EmaAlert(Base):
+    """Dedup log for EMA185 (4H) break signals so each 4H candle alerts at most once."""
+    __tablename__ = "ema_alerts"
+    __table_args__ = (UniqueConstraint("symbol", "candle_t_ms", "signal", name="uq_ema_alert"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    signal: Mapped[str] = mapped_column(String(8))            # LONG | SHORT
+    candle_t_ms: Mapped[int] = mapped_column(BigInteger, index=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ema: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

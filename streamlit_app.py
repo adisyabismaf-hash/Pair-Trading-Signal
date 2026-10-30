@@ -385,7 +385,8 @@ st.sidebar.markdown("## 🧭 Trading<span style='color:#34d399'>Command</span>Ce
                     unsafe_allow_html=True)
 st.sidebar.caption("Pair Trading · MA50 · Agent Signal On-Chain")
 page = st.sidebar.radio("Menu", ["🏠 Ringkasan", "🔁 Pair Trading", "⭐ Recommended",
-                                 "🤖 Agent Signal", "📈 Performa", "⚙️ Pengaturan"],
+                                 "📐 EMA185 4H", "🤖 Agent Signal", "📈 Performa",
+                                 "⚙️ Pengaturan"],
                         label_visibility="collapsed")
 
 st.sidebar.divider()
@@ -1038,12 +1039,67 @@ def page_recommended():
 
 # ============================================================ router
 
+def page_ema():
+    st.markdown("# 📐 EMA185 — Timeframe 4H")
+    st.caption("Sinyal break EMA185 (4H). LONG = 3 candle close di atas EMA setelah break; "
+               "SHORT = 1 close di bawah. Scan 24/7 via GitHub Actions (ema.yml), alert ke Telegram.")
+    if not os.path.isdir(V2_DIR):
+        st.warning(f"Folder pair-trading-v2 tidak ditemukan di {V2_DIR}.")
+        return
+    if V2_DIR not in sys.path:
+        sys.path.insert(0, V2_DIR)
+    try:
+        import ema_scanner
+    except Exception as exc:
+        st.error(f"Gagal memuat ema_scanner: {exc}")
+        return
+
+    if st.button("🔄 Scan sekarang", type="primary") or "ema_rows" not in st.session_state:
+        with st.spinner("Mengambil candle 4H & menghitung EMA185…"):
+            st.session_state["ema_rows"] = ema_scanner.scan_ema()
+    rows = st.session_state["ema_rows"]
+    active = [r for r in rows if r.get("signal")]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Simbol dipantau", len(rows))
+    c2.metric("Sinyal aktif", len(active))
+    c3.metric("Di atas / bawah EMA",
+              f"{sum(r.get('side')=='above' for r in rows)} / {sum(r.get('side')=='below' for r in rows)}")
+
+    def sig_label(r):
+        if r.get("signal") == "LONG":
+            return "🟢 LONG (Buy)"
+        if r.get("signal") == "SHORT":
+            return "🔴 SHORT (Sell)"
+        return "▲ di atas" if r.get("side") == "above" else "▼ di bawah" if r.get("side") == "below" else "—"
+
+    st.dataframe(pd.DataFrame([{
+        "Simbol": r["symbol"],
+        "Posisi / Sinyal": sig_label(r),
+        "Harga": r.get("price"),
+        "EMA185": r.get("ema"),
+        "Jarak %": r.get("dist_pct"),
+        "Close beruntun": (f"{r['consec_above']}↑" if r.get("side") == "above"
+                           else f"{r['consec_below']}↓" if r.get("side") == "below" else "—"),
+    } for r in rows]), width="stretch", hide_index=True)
+
+    if st.button("📨 Kirim sinyal aktif ke Telegram", disabled=not active):
+        msg = ema_scanner.format_ema_telegram(rows)
+        ok = telegram_notifier.send_message(msg) if msg else False
+        st.session_state["notice"] = f"📨 {len(active)} sinyal EMA terkirim." if ok else ""
+        if not ok:
+            st.session_state["notice_err"] = "❌ Telegram gagal / tidak ada sinyal aktif."
+        st.rerun()
+
+
 if page.startswith("🏠"):
     page_overview()
 elif page.startswith("🔁"):
     page_pair()
 elif page.startswith("⭐"):
     page_recommended()
+elif page.startswith("📐"):
+    page_ema()
 elif page.startswith("🤖"):
     page_agent()
 elif page.startswith("📈"):
