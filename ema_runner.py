@@ -52,22 +52,25 @@ def scan_and_alert() -> int:
                 EmaAlert.symbol == r["symbol"],
                 EmaAlert.candle_t_ms == r["candle_t_ms"],
                 EmaAlert.signal == r["signal"])).first()
-            if exists:
-                continue
-            db.add(EmaAlert(symbol=r["symbol"], signal=r["signal"],
-                            candle_t_ms=r["candle_t_ms"], price=r.get("price"),
-                            ema=r.get("ema")))
-            fresh.append(r)
-        db.commit()
-    finally:
-        db.close()
+            if not exists:
+                fresh.append(r)
 
-    if fresh:
+        if not fresh:
+            logger.info("EMA%d (4H): %d active but all already alerted.", EMA_PERIOD, len(active))
+            return 0
+
         msg = ema_scanner.format_ema_telegram(fresh, period=EMA_PERIOD)
         ok = telegram_notifier.send_message(msg) if msg else False
         logger.info("EMA%d (4H): %d new signal(s), telegram sent=%s", EMA_PERIOD, len(fresh), ok)
-    else:
-        logger.info("EMA%d (4H): %d active but all already alerted.", EMA_PERIOD, len(active))
+        if not ok:
+            return 0    # not recorded, so the next run retries instead of losing the signal
+        for r in fresh:
+            db.add(EmaAlert(symbol=r["symbol"], signal=r["signal"],
+                            candle_t_ms=r["candle_t_ms"], price=r.get("price"),
+                            ema=r.get("ema")))
+        db.commit()
+    finally:
+        db.close()
     return len(fresh)
 
 

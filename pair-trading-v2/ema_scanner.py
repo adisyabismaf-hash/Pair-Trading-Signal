@@ -16,6 +16,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -26,8 +27,11 @@ from analytics.ema_signal import ema_break_signal
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ema_scanner")
 
+WIB = timezone(timedelta(hours=7))
 DEFAULT_SYMBOLS = [sym for sym, _src, _tk in CRYPTO_UNIVERSE]  # BTC, ETH, SOL, ... (Extended)
 ARROW = {"LONG": "🟢", "SHORT": "🔴"}
+FOUR_HOURS_MS = 4 * 60 * 60 * 1000
+RECHECK_CANDLES = 3  # re-check the last 12h of closed candles to survive late cron runs
 
 
 def fetch_4h(ticker: str, limit: int = 1000) -> list[dict]:
@@ -54,17 +58,37 @@ def fetch_4h(ticker: str, limit: int = 1000) -> list[dict]:
     raise RuntimeError(f"Extended 4H unreachable for {ticker}: {last_err}")
 
 
+def closed_only(candles: list[dict], now_ms: int | None = None) -> list[dict]:
+    """Drop the still-forming candle. Extended's T is the candle OPEN time, so a 4H candle
+    has closed only once T + 4H has passed — the rule is defined on closes."""
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    return [c for c in candles if c["t_ms"] + FOUR_HOURS_MS <= now_ms]
+
+
 def analyze_symbol(symbol: str, ticker: str | None = None, *, period: int = 185,
-                   confirm_long: int = 3, confirm_short: int = 1) -> dict:
-    """Fetch 4H candles and compute the EMA185 break state for one symbol."""
+                   confirm_long: int = 3, confirm_short: int = 1,
+                   recheck_candles: int = RECHECK_CANDLES) -> dict:
+    """EMA185 break state for one symbol, on closed 4H candles only.
+
+    A signal fires on exactly one candle, and GitHub Actions cron can run hours late, so
+    the last `recheck_candles` closed candles are re-checked rather than only the newest.
+    `candle_t_ms` is the trigger candle, which is what callers dedup on."""
     ticker = ticker or f"{symbol}-USD"
-    candles = fetch_4h(ticker)
+    candles = closed_only(fetch_4h(ticker))
     closes = [c["close"] for c in candles]
     state = ema_break_signal(closes, period=period,
                              confirm_long=confirm_long, confirm_short=confirm_short)
     state["symbol"] = symbol
     state["candle_t_ms"] = candles[-1]["t_ms"] if candles else None
     state["candles"] = len(candles)
+    for back in range(1, recheck_candles):
+        if state["signal"] or len(closes) <= back:
+            break
+        past = ema_break_signal(closes[:-back], period=period,
+                                confirm_long=confirm_long, confirm_short=confirm_short)
+        if past["signal"]:
+            state["signal"] = past["signal"]
+            state["candle_t_ms"] = candles[-1 - back]["t_ms"]
     return state
 
 
@@ -90,8 +114,10 @@ def format_ema_telegram(rows: list[dict], *, period: int = 185) -> str | None:
         emoji = ARROW.get(r["signal"], "")
         action = "LONG (Buy)" if r["signal"] == "LONG" else "SHORT (Sell)"
         dist = f" ({r['dist_pct']:+.1f}% dari EMA)" if r.get("dist_pct") is not None else ""
+        close_wib = datetime.fromtimestamp((r["candle_t_ms"] + FOUR_HOURS_MS) / 1000, WIB)
         lines.append(f"{emoji} <b>{r['symbol']}</b> — {action}\n"
-                     f"   harga {r['price']:,.4g} · EMA{period} {r['ema']:,.4g}{dist}")
+                     f"   candle close {close_wib:%d %b %H:%M} WIB\n"
+                     f"   harga {r['price']:,.6g} · EMA{period} {r['ema']:,.6g}{dist}")
     lines += ["", "Aturan: LONG = 3 close 4H di atas EMA185 setelah break; "
               "SHORT = 1 close di bawah."]
     return "\n".join(lines)
