@@ -28,9 +28,17 @@ def main() -> int:
         )
         # A scan that finished but had per-market errors is still a successful run;
         # individual errors are recorded in scan_logs and surfaced on the dashboard.
-        return 0
     finally:
         db.close()
+
+    # EMA185 (4H) break signals run in the SAME 24/7 workflow (one bot). A failure here
+    # must not fail the pair/MA50 scan, so it's isolated.
+    try:
+        import ema_runner
+        ema_runner.scan_and_alert()
+    except Exception:
+        logger.exception("EMA185 scan failed (pair scan still OK)")
+    return 0
 
 
 if __name__ == "__main__":
